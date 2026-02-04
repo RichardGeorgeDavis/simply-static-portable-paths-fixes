@@ -2,11 +2,14 @@
 /**
  * Plugin Name: Simply Static Portable Paths
  * Description: Rewrites wp-content/wp-includes URLs in exported HTML so static archives work from any folder depth.
- * Version: 0.8.0
+ * Version: 0.8.4
  * Author: Lucidity / RGD
  */
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+// Disabled: export outputs can be buggy. Use the post-export fixer instead.
+if ( true ) { return; }
 
 use Simply_Static\Util;
 
@@ -70,6 +73,21 @@ add_filter( 'ss_html_after_download', function( $html, $url ) {
 }, 9999, 2 );
 
 /**
+ * Exclude common account/commerce and API paths from static export.
+ */
+add_filter( 'simply_static_excluded_paths', function ( $paths ) {
+	return array_merge( $paths, [
+		'/cart/',
+		'/checkout/',
+		'/my-account/',
+		'/order-received/',
+		'/wp-json/',
+		'/wc-api/',
+		'/author/',
+	] );
+} );
+
+/**
  * Rewrites relevant attributes throughout the DOM.
  */
 function sspp_rewrite_dom_attributes( DOMDocument $dom, $prefix ) {
@@ -131,6 +149,9 @@ function sspp_rewrite_path_value( $value, $prefix ) {
 	// Strip origin host if present, so same-origin absolute URLs become root-relative first.
 	$value = sspp_strip_origin_host_anywhere( $value );
 	$value = sspp_normalize_double_slash_root_paths( $value );
+	// Normalize escaped slashes in wp-content/wp-includes for attribute values.
+	$value = preg_replace( '#\\\\/(wp-content|wp-includes)#', '/$1', $value );
+	$value = preg_replace( '#(wp-content|wp-includes)\\\\/#', '$1/', $value );
 
 	// Skip external absolute URLs.
 	if ( preg_match( '#^https?:\/\/#i', $value ) || preg_match( '#^\/\/#', $value ) ) {
@@ -202,6 +223,10 @@ function sspp_rewrite_dot_slash_root_paths( $text, $prefix ) {
 
 		// Defensive: ".//wp-content" without trailing slash
 		$text = preg_replace( '#\.(?:\/){1,2}' . preg_quote( $dir, '#' ) . '\b#i', $replacement, $text );
+
+		// Broken dot-runs like "./.... /wp-content" -> correct prefix.
+		$text = preg_replace( '#\./\.+/' . preg_quote( $dir, '#' ) . '(\/)#i', $replacement . '$1', $text );
+		$text = preg_replace( '#\./\.+/' . preg_quote( $dir, '#' ) . '\b#i', $replacement, $text );
 	}
 
 	return $text;
@@ -487,9 +512,21 @@ function sspp_rewrite_json_escaped_paths( $text, $prefix ) {
 	// Convert ../ into ..\/ for JSON strings
 	$json_prefix = str_replace( '/', '\\/', $prefix );
 
-	// Root-relative JSON-escaped.
-	$text = str_replace( '\\/wp-content\\/', $json_prefix . 'wp-content\\/', $text );
-	$text = str_replace( '\\/wp-includes\\/', $json_prefix . 'wp-includes\\/', $text );
+	// Root-relative JSON-escaped (avoid already-relative ..\/wp-content\/).
+	$text = preg_replace_callback(
+		'#(^|[^.])\\\\/wp-content\\\\/#',
+		function( $m ) use ( $json_prefix ) {
+			return $m[1] . $json_prefix . 'wp-content\\/';
+		},
+		$text
+	);
+	$text = preg_replace_callback(
+		'#(^|[^.])\\\\/wp-includes\\\\/#',
+		function( $m ) use ( $json_prefix ) {
+			return $m[1] . $json_prefix . 'wp-includes\\/';
+		},
+		$text
+	);
 
 	// Dot-slash JSON-escaped (.\/wp-content\/ or .\/.\/wp-content\/).
 	$text = preg_replace( '#\\\.(?:\\\\/){1,2}wp-content\\\\/#i', $json_prefix . 'wp-content\\/', $text );

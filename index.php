@@ -11,6 +11,9 @@ $selected_site = $_POST['site'] ?? '';
 $apply = isset($_POST['apply']);
 $rewrite_hosts = $_SERVER['REQUEST_METHOD'] === 'POST' ? isset($_POST['rewrite_hosts']) : true;
 $selected_site = $selected_site !== '' ? basename((string)$selected_site) : '';
+if ($selected_site !== '' && !in_array($selected_site, $sites, true)) {
+    $selected_site = '';
+}
 $selected_site_url = $selected_site !== '' ? 'sites/' . rawurlencode($selected_site) . '/' : '';
 
 $result = null;
@@ -30,8 +33,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-function h(string $value): string {
-    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+function h(string|int|float|null $value): string {
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 }
 
 ?>
@@ -43,17 +46,19 @@ function h(string $value): string {
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 24px; color: #222; }
         h1 { margin: 0 0 12px; }
+        .version { font-size: 0.7em; color: #666; font-weight: normal; margin-left: 8px; }
         .panel { border: 1px solid #ddd; padding: 16px; border-radius: 6px; margin-bottom: 16px; }
         label { display: inline-block; margin-right: 12px; }
         select, button { padding: 6px 10px; }
         .stats { margin-top: 12px; }
         .errors { color: #b00020; }
         .files { max-height: 260px; overflow: auto; background: #fafafa; padding: 8px; border: 1px solid #eee; }
+        .missing-sources { color: #666; margin-left: 6px; }
         code { background: #f5f5f5; padding: 1px 4px; border-radius: 4px; }
     </style>
 </head>
 <body>
-    <h1>Simply Static Fixes</h1>
+    <h1>Simply Static Fixes <span class="version">v<?php echo h(SSPP_FIXES_VERSION); ?></span></h1>
 
     <div class="panel">
         <p>Put your exported static sites inside <code>simply-static-fixes/sites</code>. Each site should be its own folder.</p>
@@ -90,7 +95,8 @@ function h(string $value): string {
 
     <?php if (is_array($result)): ?>
         <div class="panel">
-            <h2>Result<?php echo $selected_site !== '' ? ' for ' . h($selected_site) : ''; ?></h2>
+            <?php $result_site = !empty($result['errors']) ? '' : $selected_site; ?>
+            <h2>Result<?php echo $result_site !== '' ? ' for ' . h($result_site) : ''; ?></h2>
             <?php if (!empty($result['errors'])): ?>
                 <div class="errors">
                     <?php foreach ($result['errors'] as $error): ?>
@@ -104,7 +110,42 @@ function h(string $value): string {
                     <div>Replacements: <?php echo (int)($result['replacements'] ?? 0); ?></div>
                     <div>Bytes before: <?php echo (int)($result['bytes_before'] ?? 0); ?></div>
                     <div>Bytes after: <?php echo (int)($result['bytes_after'] ?? 0); ?></div>
+                    <div>Run version: <?php echo (int)($result['run_version'] ?? 0); ?><?php echo !empty($result['run_version_updated']) ? ' (updated)' : ''; ?></div>
+                    <div>Missing files (unique): <?php echo (int)($result['missing_urls_total'] ?? 0); ?></div>
+                    <div>Missing references: <?php echo (int)($result['missing_url_hits'] ?? 0); ?></div>
+                    <div>Absolute URLs (unique): <?php echo (int)($result['absolute_urls_total'] ?? 0); ?></div>
+                    <div>Absolute URL references: <?php echo (int)($result['absolute_url_hits'] ?? 0); ?></div>
                 </div>
+
+                <?php if (!empty($result['absolute_urls'])): ?>
+                    <h3>Absolute URLs (internal only)</h3>
+                    <div class="files">
+                        <?php foreach ($result['absolute_urls'] as $absolute): ?>
+                            <div>
+                                <code><?php echo h($absolute['url'] ?? ''); ?></code>
+                                (<?php echo (int)($absolute['count'] ?? 0); ?>)
+                                <?php if (!empty($absolute['files'])): ?>
+                                    <span class="missing-sources">e.g. <?php echo h(implode(', ', $absolute['files'])); ?></span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
+
+                <?php if (!empty($result['missing_urls'])): ?>
+                    <h3>Missing Files (by reference)</h3>
+                    <div class="files">
+                        <?php foreach ($result['missing_urls'] as $missing_path => $data): ?>
+                            <div>
+                                <code><?php echo h($missing_path); ?></code>
+                                (<?php echo (int)($data['count'] ?? 0); ?>)
+                                <?php if (!empty($data['files'])): ?>
+                                    <span class="missing-sources">e.g. <?php echo h(implode(', ', $data['files'])); ?></span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                <?php endif; ?>
 
                 <?php if (!empty($result['changed_files'])): ?>
                     <h3>Changed Files<?php echo $selected_site !== '' ? ' for ' . h($selected_site) : ''; ?></h3>

@@ -2,6 +2,10 @@
 
 This tool post-processes exported Simply Static folders and rewrites paths so the site works offline.
 
+## Versions
+- Fixes tool: 0.2.0
+- WordPress plugin: 0.8.4 (disabled — use the fixer instead; see header in `add-this/simply-static-portable-paths.php`)
+
 ## Structure
 ```
 simply-static-fixes/
@@ -21,10 +25,14 @@ simply-static-fixes/
 5. If the stats look right, run again with **Apply changes** checked.
 
 ## Options
-- **Strip absolute hosts**: rewrites `http(s)://host/wp-content/...` and `//host/wp-content/...` to root-relative first, then applies the correct prefix. Useful when exports still contain absolute URLs.
+- **Strip absolute hosts**: rewrites same-origin absolute URLs (canonical host or `.local`) for `wp-content` / `wp-includes` to root-relative first, then applies the correct prefix. External/CDN hosts are left as-is.
 - **Apply changes**: unchecked = dry run (no writes).
 
 ## Notes
 - Home pages should resolve as `./wp-content/...`
 - Subpages should resolve as `../wp-content/...`
 - JSON blobs (Divi `data-et-multi-view`) are rewritten too.
+
+## References
+- [Simply Static](https://simplystatic.com/)
+- [Simply Static (WordPress Plugin)](https://wordpress.org/plugins/simply-static/)
