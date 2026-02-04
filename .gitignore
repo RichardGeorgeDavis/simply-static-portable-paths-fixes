@@ -1,0 +1,7 @@
+/sites/*
+!/sites/.gitkeep
+/reports/*
+!/reports/.gitkeep
+
+# macOS
+.DS_Store
