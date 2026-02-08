@@ -82,7 +82,7 @@ function h(string|int|float|null $value): string {
                 <?php endif; ?>
                 <label>
                     <input type="checkbox" name="rewrite_hosts" <?php echo $rewrite_hosts ? 'checked' : ''; ?>>
-                    Strip absolute hosts for <code>/wp-content</code> + <code>/wp-includes</code>
+                    Rewrite <code>.local</code> absolute URLs (including <code>//</code>)
                 </label>
                 <label>
                     <input type="checkbox" name="apply" <?php echo $apply ? 'checked' : ''; ?>>
@@ -118,7 +118,7 @@ function h(string|int|float|null $value): string {
                 </div>
 
                 <?php if (!empty($result['absolute_urls'])): ?>
-                    <h3>Absolute URLs (internal only)</h3>
+                    <h3>Absolute URLs (.local only)</h3>
                     <div class="files">
                         <?php foreach ($result['absolute_urls'] as $absolute): ?>
                             <div>

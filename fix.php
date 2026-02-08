@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-const SSPP_FIXES_VERSION = '0.2.0';
+const SSPP_FIXES_VERSION = '0.3.3';
 
 function sspp_fix_list_sites(string $sites_dir): array {
     if (!is_dir($sites_dir)) {
@@ -57,8 +57,6 @@ function sspp_fix_run(string $site_path, array $options): array {
         return $stats;
     }
 
-    $internal_hosts = sspp_fix_discover_internal_hosts($site_path, $extensions);
-    $rewrite_hosts_list = $rewrite_hosts ? $internal_hosts : [];
     $iterator = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($site_path, FilesystemIterator::SKIP_DOTS)
     );
@@ -95,11 +93,15 @@ function sspp_fix_run(string $site_path, array $options): array {
 
         $prefix = sspp_fix_prefix_for_file($site_path, $path);
 
+        $current_file = sspp_fix_relative_path($site_path, $path);
+        $is_asset = sspp_fix_is_asset_path($current_file);
+
         $counts = 0;
         $new_content = sspp_fix_rewrite_content(
             $content,
             $prefix,
-            $rewrite_hosts_list,
+            $rewrite_hosts,
+            !$is_asset,
             $counts
         );
 
@@ -107,38 +109,34 @@ function sspp_fix_run(string $site_path, array $options): array {
         $stats['bytes_after'] += strlen($new_content);
         $stats['replacements'] += $counts;
 
-        $current_file = sspp_fix_relative_path($site_path, $path);
-        $found_paths = sspp_fix_extract_asset_paths($new_content);
-        foreach ($found_paths as $relative_path) {
-            $resolved = sspp_fix_resolve_path(dirname($path), $relative_path);
-            if (!sspp_fix_reference_exists($resolved, $exists_cache)) {
-                $relative_from_site = sspp_fix_relative_path($site_path, $resolved);
-                sspp_fix_record_missing($missing, $relative_from_site, $current_file, $missing_hits);
+        if (!$is_asset) {
+            $found_paths = sspp_fix_extract_relative_paths($new_content);
+            foreach ($found_paths as $relative_path) {
+                if ($relative_path === '') {
+                    continue;
+                }
+                $base_dir = strpos($relative_path, '/') === 0 ? $site_path : dirname($path);
+                $resolved = sspp_fix_resolve_path($base_dir, $relative_path);
+                if (!sspp_fix_reference_exists($resolved, $exists_cache)) {
+                    $relative_from_site = sspp_fix_relative_path($site_path, $resolved);
+                    sspp_fix_record_missing($missing, $relative_from_site, $current_file, $missing_hits);
+                }
             }
-        }
 
-        $root_paths = sspp_fix_extract_root_paths($new_content);
-        foreach ($root_paths as $root_path) {
-            $resolved = sspp_fix_resolve_path($site_path, $root_path);
-            if (!sspp_fix_reference_exists($resolved, $exists_cache)) {
-                $relative_from_site = sspp_fix_relative_path($site_path, $resolved);
-                sspp_fix_record_missing($missing, $relative_from_site, $current_file, $missing_hits);
+            $absolute_urls = sspp_fix_extract_absolute_urls($new_content);
+            foreach ($absolute_urls as $absolute) {
+                $host = $absolute['host'] ?? '';
+                if ($host === '') {
+                    continue;
+                }
+                $path_value = $absolute['path'] ?? '/';
+                $absolute_candidates[] = [
+                    'host' => $host,
+                    'path' => $path_value,
+                    'display' => $absolute['display'] ?? ($host . $path_value),
+                    'file' => $current_file,
+                ];
             }
-        }
-
-        $absolute_urls = sspp_fix_extract_absolute_urls($new_content);
-        foreach ($absolute_urls as $absolute) {
-            $host = $absolute['host'] ?? '';
-            if ($host === '') {
-                continue;
-            }
-            $path_value = $absolute['path'] ?? '/';
-            $absolute_candidates[] = [
-                'host' => $host,
-                'path' => $path_value,
-                'display' => $absolute['display'] ?? ($host . $path_value),
-                'file' => $current_file,
-            ];
         }
 
         if ($new_content !== $content) {
@@ -164,8 +162,7 @@ function sspp_fix_run(string $site_path, array $options): array {
     $absolute_hits = 0;
     foreach ($absolute_candidates as $candidate) {
         $host = $candidate['host'];
-        $base_host = sspp_fix_host_base($host);
-        if (!isset($internal_hosts[$host]) && !isset($internal_hosts[$base_host])) {
+        if (!sspp_fix_is_local_host($host)) {
             continue;
         }
 
@@ -222,6 +219,11 @@ function sspp_fix_relative_path(string $root, string $path): string {
     return $path;
 }
 
+function sspp_fix_is_asset_path(string $relative_path): bool {
+    $relative_path = ltrim(str_replace('\\', '/', $relative_path), '/');
+    return str_starts_with($relative_path, 'wp-content/') || str_starts_with($relative_path, 'wp-includes/');
+}
+
 function sspp_fix_record_missing(array &$missing, string $relative_from_site, string $current_file, int &$missing_hits): void {
     if (!isset($missing[$relative_from_site])) {
         $missing[$relative_from_site] = [
@@ -243,6 +245,39 @@ function sspp_fix_reference_exists(string $resolved_path, array &$exists_cache):
 
     $exists_cache[$resolved_path] = file_exists($resolved_path);
     return $exists_cache[$resolved_path];
+}
+
+function sspp_fix_missing_ignore_patterns(array $options): array {
+    $defaults = [
+        '#^wp-admin/#',
+        '#^wp-admin/admin-ajax\.php$#',
+        '#^wp-includes/js/wp-util\.min\.js$#',
+        '#^wp-includes/js/underscore\.min\.js$#',
+        '#^wp-content/plugins/woocommerce/assets/js/frontend/add-to-cart\.min\.js$#',
+    ];
+
+    $custom = $options['missing_ignore'] ?? [];
+    if (!is_array($custom)) {
+        $custom = [];
+    }
+
+    return array_values(array_merge($defaults, $custom));
+}
+
+function sspp_fix_is_missing_ignored(string $relative_path, array $patterns): bool {
+    if ($relative_path === '') {
+        return false;
+    }
+
+    foreach ($patterns as $pattern) {
+        if (@preg_match($pattern, $relative_path)) {
+            if (preg_match($pattern, $relative_path)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 function sspp_fix_discover_internal_hosts(string $site_path, array $extensions): array {
@@ -429,7 +464,7 @@ function sspp_fix_clean_root_path(string $value): string {
 
 function sspp_fix_extract_absolute_urls(string $text): array {
     $normalized = str_replace('\\/', '/', $text);
-    $pattern = "#(?i)(https?:\\/\\/|\\/\\/)([^\\/\\s\"'\\)\\]>,]+)(\\/[^\\s\"'\\)\\]>,]*)?#";
+    $pattern = "#(?i)(https?:\\/\\/|\\/\\/)([^\\/\\s\"'\\)\\]>,<]+)(\\/[^\\s\"'\\)\\]>,<]*)?#";
 
     $matches = [];
     preg_match_all($pattern, $normalized, $matches, PREG_SET_ORDER);
@@ -440,11 +475,16 @@ function sspp_fix_extract_absolute_urls(string $text): array {
         $host = strtolower($match[2] ?? '');
         $path = $match[3] ?? '/';
         $path = preg_split('/[?#]/', $path, 2)[0] ?? '/';
+        $path = preg_split('/</', $path, 2)[0] ?? $path;
+        $path = preg_split('/&lt;/i', $path, 2)[0] ?? $path;
         if ($path === '') {
             $path = '/';
         }
         $path = rtrim($path, '\\');
         if ($host === '') {
+            continue;
+        }
+        if (strpos($path, '<') !== false || strpos($path, '>') !== false) {
             continue;
         }
 
@@ -456,6 +496,68 @@ function sspp_fix_extract_absolute_urls(string $text): array {
     }
 
     return $results;
+}
+
+function sspp_fix_extract_relative_paths(string $text): array {
+    $patterns = [
+        '#(^|["\'\\(\\s=\\[,>])(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#',
+        '#(&quot;)(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#i',
+        '#(^|["\'\\(\\s=\\[,>])((?:\\.+/)+[^\\s"\'\\)\\]>,<]*)#',
+        '#(&quot;)((?:\\.+/)+[^\\s"\'\\)\\]>,<]*)#i',
+        '#(^|["\'\\(\\s=\\[,>])(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#',
+        '#(&quot;)(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#i',
+        '#(^|["\'\\(\\s=\\[,>])((?:\\.+\\\\/)+[^\\s"\'\\)\\]>,<]*)#',
+        '#(&quot;)((?:\\.+\\\\/)+[^\\s"\'\\)\\]>,<]*)#i',
+    ];
+
+    $results = [];
+    foreach ($patterns as $pattern) {
+        $matches = [];
+        preg_match_all($pattern, $text, $matches, PREG_SET_ORDER);
+        foreach ($matches as $match) {
+            $value = $match[2] ?? '';
+            if ($value === '') {
+                continue;
+            }
+            $clean = sspp_fix_clean_relative_path($value);
+            if ($clean !== '') {
+                $results[] = $clean;
+            }
+        }
+    }
+
+    return $results;
+}
+
+function sspp_fix_clean_relative_path(string $value): string {
+    $value = trim($value);
+    if ($value === '') {
+        return '';
+    }
+
+    $parts = preg_split('/<|&lt;/i', $value, 2);
+    $value = $parts[0] ?? '';
+    $parts = preg_split('/[?#]/', $value, 2);
+    $value = $parts[0] ?? '';
+    $value = rtrim($value, '\\');
+    $value = str_replace('\\/', '/', $value);
+    $value = trim($value);
+
+    if ($value === '') {
+        return '';
+    }
+
+    if (preg_match('#^(?:[a-z][a-z0-9+.-]*:)?//#i', $value)) {
+        return '';
+    }
+    if (preg_match('#^(?:data:|mailto:|tel:|javascript:)#i', $value)) {
+        return '';
+    }
+    if (!preg_match('#^(?:/|\\./|\\.\\./)#', $value)) {
+        return '';
+    }
+
+    return $value;
 }
 
 function sspp_fix_extract_canonical_hosts(string $text): array {
@@ -582,22 +684,204 @@ function sspp_fix_prefix_for_file(string $site_path, string $file_path): string 
     return str_repeat('../', $depth);
 }
 
-function sspp_fix_rewrite_content(string $text, string $prefix, array $internal_hosts, int &$count): string {
+function sspp_fix_rewrite_content(string $text, string $prefix, bool $rewrite_hosts, bool $rewrite_paths, int &$count): string {
     $count = 0;
+    $prefix_escaped = str_replace('/', '\\/', $prefix);
 
-    $text = sspp_fix_normalize_double_slash_root_paths($text, $count);
-    $text = sspp_fix_normalize_dot_slash_root_paths($text, $count);
-    $text = sspp_fix_unescape_wp_paths($text, $count);
-
-    if (!empty($internal_hosts)) {
-        $text = sspp_fix_strip_absolute_hosts($text, $internal_hosts, $count);
+    if ($rewrite_hosts) {
+        $text = sspp_fix_rewrite_local_hosts($text, $prefix, $prefix_escaped, $count);
     }
 
-    $text = sspp_fix_rewrite_relative_chains($text, $prefix, $count);
-    $text = sspp_fix_rewrite_root_paths($text, $prefix, $count);
-    $text = sspp_fix_rewrite_json_paths($text, $prefix, $count);
+    if ($rewrite_paths) {
+        $text = sspp_fix_rewrite_root_relative_paths($text, $prefix, $prefix_escaped, $count);
+        $text = sspp_fix_rewrite_dot_relative_paths($text, $prefix, $prefix_escaped, $count);
+    }
 
     return $text;
+}
+
+function sspp_fix_rewrite_local_hosts(string $text, string $prefix, string $prefix_escaped, int &$count): string {
+    $local_count = 0;
+
+    $pattern = '#(?i)(https?:\\/\\/|\\/\\/)([A-Za-z0-9.-]+(?::\\d+)?)(\\/[^\\s"\'\\)\\]>,<]*)?#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        $host = $match[2] ?? '';
+        if (!sspp_fix_is_local_host($host)) {
+            return $match[0];
+        }
+
+        $path = $match[3] ?? '';
+        $replacement = sspp_fix_build_relative_replacement($path, $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(?i)(https?:\\\\/\\\\/|\\\\/\\\\/)([A-Za-z0-9.-]+(?::\\d+)?)(\\\\/[^\\s"\'\\)\\]>,<]*)?#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        $host = $match[2] ?? '';
+        if (!sspp_fix_is_local_host($host)) {
+            return $match[0];
+        }
+
+        $path = $match[3] ?? '';
+        $replacement = sspp_fix_build_relative_replacement($path, $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $count += $local_count;
+    return $text;
+}
+
+function sspp_fix_rewrite_root_relative_paths(string $text, string $prefix, string $prefix_escaped, int &$count): string {
+    $local_count = 0;
+
+    $pattern = '#(^|["\'\\(\\s=\\[,>])(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(&quot;)(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(^|["\'\\(\\s=\\[,>])(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(&quot;)(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $count += $local_count;
+    return $text;
+}
+
+function sspp_fix_rewrite_dot_relative_paths(string $text, string $prefix, string $prefix_escaped, int &$count): string {
+    $local_count = 0;
+
+    $pattern = '#(^|["\'\\(\\s=\\[,>])((?:\\.+(?:/|\\\\/))+[^\\s"\'\\)\\]>,<]*)#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, $prefix_escaped, &$local_count): string {
+        $token = $match[2];
+        if (!sspp_fix_has_broken_dot_run($token)) {
+            return $match[0];
+        }
+        if (!preg_match('#^((?:\\.+(?:/|\\\\/))+)(.*)$#', $token, $parts)) {
+            return $match[0];
+        }
+        $use_escaped = strpos($token, '\\/') !== false;
+        $rest = sspp_fix_strip_leading_slash($parts[2] ?? '', $use_escaped);
+        $prefix_to_use = $use_escaped ? $prefix_escaped : $prefix;
+        $replacement = $match[1] . $prefix_to_use . $rest;
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(&quot;)((?:\\.+(?:/|\\\\/))+[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, $prefix_escaped, &$local_count): string {
+        $token = $match[2];
+        if (!sspp_fix_has_broken_dot_run($token)) {
+            return $match[0];
+        }
+        if (!preg_match('#^((?:\\.+(?:/|\\\\/))+)(.*)$#', $token, $parts)) {
+            return $match[0];
+        }
+        $use_escaped = strpos($token, '\\/') !== false;
+        $rest = sspp_fix_strip_leading_slash($parts[2] ?? '', $use_escaped);
+        $prefix_to_use = $use_escaped ? $prefix_escaped : $prefix;
+        $replacement = $match[1] . $prefix_to_use . $rest;
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $count += $local_count;
+    return $text;
+}
+
+function sspp_fix_has_broken_dot_run(string $token): bool {
+    $normalized = str_replace('\\/', '/', $token);
+    return preg_match('#\\.{3,}[/]#', $normalized) === 1;
+}
+
+function sspp_fix_build_relative_replacement(string $path, string $prefix, bool $escaped): string {
+    $path = sspp_fix_strip_path_suffix($path);
+    if ($path === '') {
+        return $prefix;
+    }
+
+    $path = sspp_fix_strip_leading_slash($path, $escaped);
+    if ($path === '') {
+        return $prefix;
+    }
+
+    return $prefix . $path;
+}
+
+function sspp_fix_strip_path_suffix(string $path): string {
+    $parts = preg_split('/<|&lt;/i', $path, 2);
+    return $parts[0] ?? '';
+}
+
+function sspp_fix_strip_leading_slash(string $path, bool $escaped): string {
+    if ($path === '') {
+        return '';
+    }
+
+    if ($escaped) {
+        if (strpos($path, '\\/') === 0) {
+            return substr($path, 2);
+        }
+        if (strpos($path, '/') === 0) {
+            return substr($path, 1);
+        }
+        return $path;
+    }
+
+    if (strpos($path, '/') === 0) {
+        return substr($path, 1);
+    }
+    if (strpos($path, '\\/') === 0) {
+        return substr($path, 2);
+    }
+
+    return $path;
 }
 
 function sspp_fix_normalize_double_slash_root_paths(string $text, int &$count): string {
@@ -691,6 +975,12 @@ function sspp_fix_rewrite_relative_chains(string $text, string $prefix, int &$co
     $text = preg_replace('#(^|["\'\(\s=:\[,])(?:\.+/)+wp-includes/#', '$1' . $prefix . 'wp-includes/', $text, -1, $c2);
     $count += $c2;
 
+    $text = preg_replace('#(&quot;)(?:\./|\../)+wp-content/#', '$1' . $prefix . 'wp-content/', $text, -1, $c3);
+    $count += $c3;
+
+    $text = preg_replace('#(&quot;)(?:\./|\../)+wp-includes/#', '$1' . $prefix . 'wp-includes/', $text, -1, $c4);
+    $count += $c4;
+
     return $text;
 }
 
@@ -702,6 +992,14 @@ function sspp_fix_rewrite_root_paths(string $text, string $prefix, int &$count):
     $pattern = '#(^|["\'\(\s=:\[,])(/wp-includes/)#';
     $text = preg_replace($pattern, '$1' . $prefix . 'wp-includes/', $text, -1, $c2);
     $count += $c2;
+
+    $pattern = '#(&quot;)(/wp-content/)#';
+    $text = preg_replace($pattern, '$1' . $prefix . 'wp-content/', $text, -1, $c3);
+    $count += $c3;
+
+    $pattern = '#(&quot;)(/wp-includes/)#';
+    $text = preg_replace($pattern, '$1' . $prefix . 'wp-includes/', $text, -1, $c4);
+    $count += $c4;
 
     return $text;
 }
