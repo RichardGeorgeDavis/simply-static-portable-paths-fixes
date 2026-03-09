@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-const SSPP_FIXES_VERSION = '0.3.3';
+const SSPP_FIXES_VERSION = '0.3.12';
 
 function sspp_fix_list_sites(string $sites_dir): array {
     if (!is_dir($sites_dir)) {
@@ -49,12 +49,25 @@ function sspp_fix_run(string $site_path, array $options): array {
         'absolute_urls' => [],
         'run_version' => 0,
         'run_version_updated' => false,
+        'backup_status' => 'skipped',
+        'backup_path' => '',
         'errors' => [],
     ];
 
     if (!is_dir($site_path)) {
         $stats['errors'][] = "Site path does not exist: {$site_path}";
         return $stats;
+    }
+
+    $backup_enabled = (bool)($options['backup'] ?? true);
+    if ($apply && $backup_enabled) {
+        $backup_path = sspp_fix_backup_zip_path($site_path);
+        $stats['backup_path'] = sspp_fix_relative_path($site_path, $backup_path);
+        $backup_result = sspp_fix_ensure_backup($site_path, $backup_path, $stats['errors']);
+        $stats['backup_status'] = $backup_result;
+        if ($backup_result === 'failed') {
+            return $stats;
+        }
     }
 
     $iterator = new RecursiveIteratorIterator(
@@ -65,6 +78,7 @@ function sspp_fix_run(string $site_path, array $options): array {
     $missing_hits = 0;
     $exists_cache = [];
     $absolute_candidates = [];
+    $missing_ignore = sspp_fix_missing_ignore_patterns($options);
 
     foreach ($iterator as $file) {
         /** @var SplFileInfo $file */
@@ -119,7 +133,9 @@ function sspp_fix_run(string $site_path, array $options): array {
                 $resolved = sspp_fix_resolve_path($base_dir, $relative_path);
                 if (!sspp_fix_reference_exists($resolved, $exists_cache)) {
                     $relative_from_site = sspp_fix_relative_path($site_path, $resolved);
-                    sspp_fix_record_missing($missing, $relative_from_site, $current_file, $missing_hits);
+                    if (!sspp_fix_is_missing_ignored($relative_from_site, $missing_ignore)) {
+                        sspp_fix_record_missing($missing, $relative_from_site, $current_file, $missing_hits);
+                    }
                 }
             }
 
@@ -183,7 +199,9 @@ function sspp_fix_run(string $site_path, array $options): array {
         $resolved = sspp_fix_resolve_path($site_path, $candidate['path'] ?? '/');
         if (!sspp_fix_reference_exists($resolved, $exists_cache)) {
             $relative_from_site = sspp_fix_relative_path($site_path, $resolved);
-            sspp_fix_record_missing($missing, $relative_from_site, $candidate['file'], $missing_hits);
+            if (!sspp_fix_is_missing_ignored($relative_from_site, $missing_ignore)) {
+                sspp_fix_record_missing($missing, $relative_from_site, $candidate['file'], $missing_hits);
+            }
         }
     }
 
@@ -224,6 +242,258 @@ function sspp_fix_is_asset_path(string $relative_path): bool {
     return str_starts_with($relative_path, 'wp-content/') || str_starts_with($relative_path, 'wp-includes/');
 }
 
+function sspp_fix_backup_zip_path(string $site_path): string {
+    $site_path = rtrim(str_replace('\\', '/', $site_path), '/');
+    return $site_path . '.zip';
+}
+
+function sspp_fix_ensure_backup(string $site_path, string $backup_path, array &$errors): string {
+    if (file_exists($backup_path)) {
+        return 'exists';
+    }
+
+    $created = sspp_fix_create_backup_zip($site_path, $backup_path, $errors);
+    return $created ? 'created' : 'failed';
+}
+
+function sspp_fix_create_backup_zip(string $site_path, string $backup_path, array &$errors): bool {
+    if (!is_dir($site_path)) {
+        $errors[] = "Backup failed: site folder missing ({$site_path}).";
+        return false;
+    }
+
+    $site_path = rtrim(str_replace('\\', '/', $site_path), '/');
+    $backup_dir = dirname($backup_path);
+    if (!is_dir($backup_dir) && !mkdir($backup_dir, 0755, true)) {
+        $errors[] = "Backup failed: unable to create backup directory ({$backup_dir}).";
+        return false;
+    }
+
+    if (class_exists('ZipArchive')) {
+        $zip = new ZipArchive();
+        $result = $zip->open($backup_path, ZipArchive::CREATE);
+        if ($result !== true) {
+            $errors[] = "Backup failed: unable to open zip ({$backup_path}).";
+            return false;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($site_path, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $file) {
+            /** @var SplFileInfo $file */
+            if (!$file->isFile()) {
+                continue;
+            }
+            $full_path = str_replace('\\', '/', $file->getPathname());
+            $relative = ltrim(substr($full_path, strlen($site_path)), '/');
+            if ($relative === '') {
+                continue;
+            }
+            $zip->addFile($full_path, $relative);
+        }
+
+        if (!$zip->close()) {
+            $errors[] = "Backup failed: unable to finalize zip ({$backup_path}).";
+            return false;
+        }
+
+        return true;
+    }
+
+    if (function_exists('shell_exec')) {
+        $cmd = 'zip -r ' . escapeshellarg($backup_path) . ' .';
+        $output = shell_exec('cd ' . escapeshellarg($site_path) . ' && ' . $cmd);
+        if (!file_exists($backup_path)) {
+            $errors[] = "Backup failed: zip command did not create archive ({$backup_path}).";
+            if (is_string($output) && trim($output) !== '') {
+                $errors[] = trim($output);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    $errors[] = "Backup failed: ZipArchive is unavailable and shell_exec is disabled.";
+    return false;
+}
+
+function sspp_fix_restore_backup(string $site_path, array &$errors): bool {
+    $backup_path = sspp_fix_backup_zip_path($site_path);
+    if (!file_exists($backup_path)) {
+        $errors[] = "Restore failed: backup zip not found ({$backup_path}).";
+        return false;
+    }
+
+    if (is_dir($site_path)) {
+        $deleted = sspp_fix_delete_dir($site_path, $errors);
+        if (!$deleted && is_dir($site_path)) {
+            $fallback = $site_path . '.restore-old-' . date('Ymd-His');
+            if (!@rename($site_path, $fallback)) {
+                $errors[] = "Restore cleanup failed: unable to move existing folder ({$site_path}).";
+            }
+        }
+    }
+    if (!is_dir($site_path) && !mkdir($site_path, 0755, true)) {
+        $errors[] = "Restore failed: unable to create site directory ({$site_path}).";
+        return false;
+    }
+
+    if (class_exists('ZipArchive')) {
+        $zip = new ZipArchive();
+        $result = $zip->open($backup_path);
+        if ($result !== true) {
+            $errors[] = "Restore failed: unable to open zip ({$backup_path}).";
+            return false;
+        }
+
+        if (!$zip->extractTo($site_path)) {
+            $errors[] = "Restore failed: unable to extract zip to ({$site_path}).";
+            $zip->close();
+            return false;
+        }
+        $zip->close();
+        sspp_fix_flatten_restore($site_path, $errors);
+        return true;
+    }
+
+    if (function_exists('shell_exec')) {
+        $cmd = 'unzip -o ' . escapeshellarg($backup_path) . ' -d ' . escapeshellarg($site_path);
+        shell_exec($cmd);
+        if (!is_dir($site_path)) {
+            $errors[] = "Restore failed: unzip command did not restore directory ({$site_path}).";
+            return false;
+        }
+        sspp_fix_flatten_restore($site_path, $errors);
+        return true;
+    }
+
+    $errors[] = "Restore failed: ZipArchive is unavailable and shell_exec is disabled.";
+    return false;
+}
+
+function sspp_fix_delete_dir(string $path, array &$errors): bool {
+    if (!is_dir($path)) {
+        return true;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($iterator as $item) {
+        $item_path = $item->getPathname();
+        if ($item->isLink()) {
+            if (!@unlink($item_path)) {
+                $errors[] = "Restore cleanup failed: unable to remove symlink ({$item_path}).";
+            }
+            continue;
+        }
+        if ($item->isDir()) {
+            if (!@rmdir($item_path)) {
+                @chmod($item_path, 0777);
+                if (!@rmdir($item_path)) {
+                    $errors[] = "Restore cleanup failed: unable to remove directory ({$item_path}).";
+                }
+            }
+            continue;
+        }
+        if (!@unlink($item_path)) {
+            @chmod($item_path, 0666);
+            if (!@unlink($item_path)) {
+                $errors[] = "Restore cleanup failed: unable to remove file ({$item_path}).";
+            }
+        }
+    }
+
+    if (!@rmdir($path)) {
+        @chmod($path, 0777);
+        if (!@rmdir($path)) {
+            $errors[] = "Restore cleanup failed: unable to remove directory ({$path}).";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function sspp_fix_flatten_restore(string $site_path, array &$errors): void {
+    $site_path = rtrim($site_path, DIRECTORY_SEPARATOR);
+    $basename = basename($site_path);
+    $nested = $site_path . DIRECTORY_SEPARATOR . $basename;
+    if (!is_dir($nested)) {
+        return;
+    }
+
+    foreach (new DirectoryIterator($nested) as $item) {
+        if ($item->isDot()) {
+            continue;
+        }
+        $src = $item->getPathname();
+        $dst = $site_path . DIRECTORY_SEPARATOR . $item->getFilename();
+        if (file_exists($dst)) {
+            if (is_dir($dst)) {
+                sspp_fix_delete_dir($dst, $errors);
+            } else {
+                if (!@unlink($dst)) {
+                    @chmod($dst, 0666);
+                    @unlink($dst);
+                }
+            }
+        }
+        if (!file_exists($dst) && @rename($src, $dst)) {
+            continue;
+        }
+        if ($item->isDir()) {
+            if (sspp_fix_copy_dir($src, $dst, $errors)) {
+                sspp_fix_delete_dir($src, $errors);
+            }
+            continue;
+        }
+        if (!@copy($src, $dst)) {
+            $errors[] = "Restore flatten failed: unable to copy file ({$src}).";
+            continue;
+        }
+        @unlink($src);
+    }
+
+    if (!@rmdir($nested)) {
+        @chmod($nested, 0777);
+        @rmdir($nested);
+    }
+}
+
+function sspp_fix_copy_dir(string $src, string $dst, array &$errors): bool {
+    if (!is_dir($src)) {
+        return false;
+    }
+    if (!is_dir($dst) && !mkdir($dst, 0755, true)) {
+        $errors[] = "Restore flatten failed: unable to create directory ({$dst}).";
+        return false;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($src, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($iterator as $item) {
+        $target = $dst . DIRECTORY_SEPARATOR . $iterator->getSubPathName();
+        if ($item->isDir()) {
+            if (!is_dir($target) && !mkdir($target, 0755, true)) {
+                $errors[] = "Restore flatten failed: unable to create directory ({$target}).";
+                return false;
+            }
+            continue;
+        }
+        if (!@copy($item->getPathname(), $target)) {
+            $errors[] = "Restore flatten failed: unable to copy file ({$target}).";
+            return false;
+        }
+    }
+
+    return true;
+}
+
 function sspp_fix_record_missing(array &$missing, string $relative_from_site, string $current_file, int &$missing_hits): void {
     if (!isset($missing[$relative_from_site])) {
         $missing[$relative_from_site] = [
@@ -249,11 +519,8 @@ function sspp_fix_reference_exists(string $resolved_path, array &$exists_cache):
 
 function sspp_fix_missing_ignore_patterns(array $options): array {
     $defaults = [
-        '#^wp-admin/#',
-        '#^wp-admin/admin-ajax\.php$#',
-        '#^wp-includes/js/wp-util\.min\.js$#',
-        '#^wp-includes/js/underscore\.min\.js$#',
-        '#^wp-content/plugins/woocommerce/assets/js/frontend/add-to-cart\.min\.js$#',
+        '#^wp-content/#',
+        '#^wp-includes/#',
     ];
 
     $custom = $options['missing_ignore'] ?? [];
@@ -541,6 +808,9 @@ function sspp_fix_clean_relative_path(string $value): string {
     $value = $parts[0] ?? '';
     $value = rtrim($value, '\\');
     $value = str_replace('\\/', '/', $value);
+    $value = rtrim($value, "\"'");
+    $value = preg_replace('/&quot;$/i', '', $value);
+    $value = rtrim($value, "\"'");
     $value = trim($value);
 
     if ($value === '') {
@@ -556,8 +826,15 @@ function sspp_fix_clean_relative_path(string $value): string {
     if (!preg_match('#^(?:/|\\./|\\.\\./)#', $value)) {
         return '';
     }
+    if (sspp_fix_contains_glob_token($value)) {
+        return '';
+    }
 
     return $value;
+}
+
+function sspp_fix_contains_glob_token(string $value): bool {
+    return strpbrk($value, '*{}') !== false;
 }
 
 function sspp_fix_extract_canonical_hosts(string $text): array {
@@ -693,6 +970,7 @@ function sspp_fix_rewrite_content(string $text, string $prefix, bool $rewrite_ho
     }
 
     if ($rewrite_paths) {
+        $text = sspp_fix_rewrite_scheme_relative_root_paths($text, $prefix, $prefix_escaped, $count);
         $text = sspp_fix_rewrite_root_relative_paths($text, $prefix, $prefix_escaped, $count);
         $text = sspp_fix_rewrite_dot_relative_paths($text, $prefix, $prefix_escaped, $count);
     }
@@ -744,9 +1022,25 @@ function sspp_fix_rewrite_local_hosts(string $text, string $prefix, string $pref
 function sspp_fix_rewrite_root_relative_paths(string $text, string $prefix, string $prefix_escaped, int &$count): string {
     $local_count = 0;
 
-    $pattern = '#(^|["\'\\(\\s=\\[,>])(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#';
+    $pattern = '#(["\'])(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#';
     $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
         $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(["\'])(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
         if ($replacement === $match[0]) {
             return $match[0];
         }
@@ -756,17 +1050,10 @@ function sspp_fix_rewrite_root_relative_paths(string $text, string $prefix, stri
 
     $pattern = '#(&quot;)(\\/(?!\\/)[^\\s"\'\\)\\]>,<]*)#i';
     $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
-        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
-        if ($replacement === $match[0]) {
+        if (sspp_fix_contains_glob_token($match[2])) {
             return $match[0];
         }
-        $local_count++;
-        return $replacement;
-    }, $text);
-
-    $pattern = '#(^|["\'\\(\\s=\\[,>])(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#';
-    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
-        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
         if ($replacement === $match[0]) {
             return $match[0];
         }
@@ -776,7 +1063,128 @@ function sspp_fix_rewrite_root_relative_paths(string $text, string $prefix, stri
 
     $pattern = '#(&quot;)(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#i';
     $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
         $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(url\\(\\s*)(/(?!/)[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(url\\(\\s*)(\\\\/(?!\\\\/)[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($match[2], $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $count += $local_count;
+    return $text;
+}
+
+function sspp_fix_rewrite_scheme_relative_root_paths(string $text, string $prefix, string $prefix_escaped, int &$count): string {
+    $local_count = 0;
+    $host_guard = '(?:wp-[a-z0-9-]+|wp-content|wp-includes|wp-json)(?:/|\\\\/)';
+
+    $pattern = '#(["\'])(//'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 1);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(["\'])(\\\\/\\\\/'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 2);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(&quot;)(//'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 1);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(&quot;)(\\\\/\\\\/'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 2);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix_escaped, true);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(url\\(\\s*)(//'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 1);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix, false);
+        if ($replacement === $match[0]) {
+            return $match[0];
+        }
+        $local_count++;
+        return $replacement;
+    }, $text);
+
+    $pattern = '#(url\\(\\s*)(\\\\/\\\\/'.$host_guard.'[^\\s"\'\\)\\]>,<]*)#i';
+    $text = preg_replace_callback($pattern, function (array $match) use ($prefix_escaped, &$local_count): string {
+        if (sspp_fix_contains_glob_token($match[2])) {
+            return $match[0];
+        }
+        $path = substr($match[2], 2);
+        $replacement = $match[1] . sspp_fix_build_relative_replacement($path, $prefix_escaped, true);
         if ($replacement === $match[0]) {
             return $match[0];
         }
@@ -794,6 +1202,9 @@ function sspp_fix_rewrite_dot_relative_paths(string $text, string $prefix, strin
     $pattern = '#(^|["\'\\(\\s=\\[,>])((?:\\.+(?:/|\\\\/))+[^\\s"\'\\)\\]>,<]*)#';
     $text = preg_replace_callback($pattern, function (array $match) use ($prefix, $prefix_escaped, &$local_count): string {
         $token = $match[2];
+        if (sspp_fix_contains_glob_token($token)) {
+            return $match[0];
+        }
         if (!sspp_fix_has_broken_dot_run($token)) {
             return $match[0];
         }
@@ -814,6 +1225,9 @@ function sspp_fix_rewrite_dot_relative_paths(string $text, string $prefix, strin
     $pattern = '#(&quot;)((?:\\.+(?:/|\\\\/))+[^\\s"\'\\)\\]>,<]*)#i';
     $text = preg_replace_callback($pattern, function (array $match) use ($prefix, $prefix_escaped, &$local_count): string {
         $token = $match[2];
+        if (sspp_fix_contains_glob_token($token)) {
+            return $match[0];
+        }
         if (!sspp_fix_has_broken_dot_run($token)) {
             return $match[0];
         }

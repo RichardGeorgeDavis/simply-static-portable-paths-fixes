@@ -9,6 +9,8 @@ $sites = sspp_fix_list_sites($sites_dir);
 
 $selected_site = $_POST['site'] ?? '';
 $apply = isset($_POST['apply']);
+$action = $_POST['action'] ?? 'run';
+$action = is_string($action) ? $action : 'run';
 $rewrite_hosts = $_SERVER['REQUEST_METHOD'] === 'POST' ? isset($_POST['rewrite_hosts']) : true;
 $selected_site = $selected_site !== '' ? basename((string)$selected_site) : '';
 if ($selected_site !== '' && !in_array($selected_site, $sites, true)) {
@@ -26,10 +28,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'errors' => ['Invalid site selection.'],
         ];
     } else {
-        $result = sspp_fix_run($site_path, [
-            'apply' => $apply,
-            'rewrite_hosts' => $rewrite_hosts,
-        ]);
+        if ($action === 'restore') {
+            $errors = [];
+            $ok = sspp_fix_restore_backup($site_path, $errors);
+            $result = [
+                'restore' => true,
+                'restore_ok' => $ok,
+                'restore_path' => sspp_fix_relative_path($sites_dir, sspp_fix_backup_zip_path($site_path)),
+                'errors' => $errors,
+            ];
+        } else {
+            $result = sspp_fix_run($site_path, [
+                'apply' => $apply,
+                'rewrite_hosts' => $rewrite_hosts,
+            ]);
+        }
     }
 }
 
@@ -55,6 +68,12 @@ function h(string|int|float|null $value): string {
         .files { max-height: 260px; overflow: auto; background: #fafafa; padding: 8px; border: 1px solid #eee; }
         .missing-sources { color: #666; margin-left: 6px; }
         code { background: #f5f5f5; padding: 1px 4px; border-radius: 4px; }
+        .notice { background: #eef6ff; border: 1px solid #cfe3ff; color: #0b2f6a; padding: 8px 10px; border-radius: 6px; margin: 10px 0; }
+        .notice.success { background: #eef9f1; border-color: #cdebd6; color: #1b5e20; }
+        .progress-wrap { display: none; margin-top: 12px; }
+        .progress-wrap.active { display: block; }
+        .progress-text { font-size: 0.9em; color: #444; margin-bottom: 6px; }
+        progress { width: 100%; height: 14px; }
     </style>
 </head>
 <body>
@@ -66,7 +85,7 @@ function h(string|int|float|null $value): string {
         <?php if (empty($sites)): ?>
             <p class="errors">No sites found in <code>sites/</code>.</p>
         <?php else: ?>
-            <form method="post">
+            <form method="post" id="fix-form">
                 <label>
                     Site:
                     <select name="site">
@@ -88,7 +107,12 @@ function h(string|int|float|null $value): string {
                     <input type="checkbox" name="apply" <?php echo $apply ? 'checked' : ''; ?>>
                     Apply changes (uncheck for dry run)
                 </label>
-                <button type="submit">Run Fix</button>
+                <button type="submit" name="action" value="run">Run Fix</button>
+                <button type="submit" name="action" value="restore">Restore from backup</button>
+                <div class="progress-wrap" id="progress-wrap" aria-live="polite">
+                    <div class="progress-text" id="progress-text">Running…</div>
+                    <progress id="progress-bar" aria-label="Run progress"></progress>
+                </div>
             </form>
         <?php endif; ?>
     </div>
@@ -103,7 +127,17 @@ function h(string|int|float|null $value): string {
                         <div><?php echo h($error); ?></div>
                     <?php endforeach; ?>
                 </div>
+            <?php elseif (!empty($result['restore'])): ?>
+                <div class="stats">
+                    <div>Restore: <?php echo !empty($result['restore_ok']) ? 'completed' : 'failed'; ?></div>
+                    <?php if (!empty($result['restore_path'])): ?>
+                        <div>Backup zip: <code><?php echo h($result['restore_path']); ?></code></div>
+                    <?php endif; ?>
+                </div>
             <?php else: ?>
+                <div class="notice success">
+                    <?php echo $apply ? 'Complete: changes applied.' : 'Complete: dry run finished.'; ?>
+                </div>
                 <div class="stats">
                     <div>Files scanned: <?php echo (int)($result['files_scanned'] ?? 0); ?></div>
                     <div>Files changed: <?php echo (int)($result['files_changed'] ?? 0); ?></div>
@@ -111,6 +145,7 @@ function h(string|int|float|null $value): string {
                     <div>Bytes before: <?php echo (int)($result['bytes_before'] ?? 0); ?></div>
                     <div>Bytes after: <?php echo (int)($result['bytes_after'] ?? 0); ?></div>
                     <div>Run version: <?php echo (int)($result['run_version'] ?? 0); ?><?php echo !empty($result['run_version_updated']) ? ' (updated)' : ''; ?></div>
+                    <div>Backup: <?php echo h($result['backup_status'] ?? 'skipped'); ?><?php echo !empty($result['backup_path']) ? ' (' . h($result['backup_path']) . ')' : ''; ?></div>
                     <div>Missing files (unique): <?php echo (int)($result['missing_urls_total'] ?? 0); ?></div>
                     <div>Missing references: <?php echo (int)($result['missing_url_hits'] ?? 0); ?></div>
                     <div>Absolute URLs (unique): <?php echo (int)($result['absolute_urls_total'] ?? 0); ?></div>
@@ -158,5 +193,17 @@ function h(string|int|float|null $value): string {
             <?php endif; ?>
         </div>
     <?php endif; ?>
+    <script>
+        (function () {
+            var form = document.getElementById('fix-form');
+            if (!form) return;
+            form.addEventListener('submit', function () {
+                var wrap = document.getElementById('progress-wrap');
+                if (wrap) wrap.classList.add('active');
+                var text = document.getElementById('progress-text');
+                if (text) text.textContent = 'Running…';
+            });
+        })();
+    </script>
 </body>
 </html>

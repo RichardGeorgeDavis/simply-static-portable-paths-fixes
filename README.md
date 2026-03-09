@@ -3,7 +3,7 @@
 This tool post-processes exported Simply Static folders and rewrites paths so the site works offline.
 
 ## Versions
-- Fixes tool: 0.3.3
+- Fixes tool: 0.3.12
 - WordPress plugin: 0.8.4 (disabled — use the fixer instead; see header in `add-this/simply-static-portable-paths.php`)
 
 ## Structure
@@ -23,6 +23,7 @@ simply-static-fixes/
 4. Open `simply-static-fixes/index.php` in your local PHP server.
 5. Select the site and run a **dry run** first (leave “Apply changes” unchecked).
 6. If the stats look right, run again with **Apply changes** checked.
+7. A backup zip (e.g., `sites/<site-name>.zip`) is created automatically before applying changes. Use “Restore from backup” to revert.
 
 ## Options
 - **Rewrite .local absolute URLs**: converts `http(s)://*.local/...` and `//*.local/...` to relative paths with the correct `./` or `../` prefix. External/CDN hosts are left as-is.
